@@ -1,0 +1,25 @@
+# Binaries
+/revita
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+
+# Go build/test coverage output
+*.out
+
+# Environment variables / secrets
+.env
+.env.*
+
+# OS files
+.DS_Store
+
+# Editor/IDE
+.idea/
+.vscode/
