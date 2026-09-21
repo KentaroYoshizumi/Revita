@@ -20,6 +20,7 @@ type MarketData struct {
 	RevPAR          float64 `json:"rev_par"`            // 部屋あたり収益（円/日）
 	CompetitorCount int     `json:"competitor_count"`   // 周辺の競合物件数
 	Currency        string  `json:"currency"`
+	DataSource      string  `json:"-"` // 各値の出典（モック/実データ）を人間向けに説明する文字列
 }
 
 // Client fetches market data for a given address.
@@ -52,5 +53,6 @@ func (c *MockClient) GetMarketData(address string) (*MarketData, error) {
 	if err := json.Unmarshal([]byte(raw), &data); err != nil {
 		return nil, err
 	}
+	data.DataSource = "全項目モックデータ（AirDNA API未契約）"
 	return &data, nil
 }

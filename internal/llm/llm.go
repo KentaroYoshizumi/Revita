@@ -50,10 +50,11 @@ func buildPrompt(p property.Property, m airdna.MarketData, r finance.Result) str
 - 広さ: %.1f平米
 - 定員: %d名
 
-【AirDNA市場データ（該当エリア）】
+【該当エリアの市場データ】
 - 平均日次単価(ADR): %.0f円
 - 稼働率: %.1f%%
 - 競合物件数: %d件
+- データ出典: %s
 
 【収支計算結果】
 - 想定月間収入: %.0f円
@@ -62,7 +63,7 @@ func buildPrompt(p property.Property, m airdna.MarketData, r finance.Result) str
 - 年間ROI: %.2f%%
 `,
 		p.Address, p.PurchasePrice, p.MonthlyRent, p.SizeSqm, p.Capacity,
-		m.ADR, m.OccupancyRate*100, m.CompetitorCount,
+		m.ADR, m.OccupancyRate*100, m.CompetitorCount, m.DataSource,
 		r.MonthlyRevenue, r.MonthlyProfit, r.AnnualProfit, r.ROIPercent,
 	)
 }
