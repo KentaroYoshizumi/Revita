@@ -1,6 +1,9 @@
-// Package llm asks a large language model (Claude or OpenAI) to judge
-// whether a property is a good investment, given its computed
-// profitability figures and the market data behind them.
+// Package llm generates the Phase 2 detailed advisory report for a
+// property, using a large LLM (Claude or OpenAI). It is the second step
+// of Revita's 2-phase pipeline: Phase 1 (see internal/jev) produces a
+// fast, low-cost Go/Conditional/NoGo screening verdict from the
+// Go-calculated numbers; this package turns that verdict, together with
+// the same numbers, into a detailed Markdown report for the user.
 package llm
 
 import (
@@ -10,24 +13,27 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/KentaroYoshizumi/Revita/internal/airdna"
 	"github.com/KentaroYoshizumi/Revita/internal/finance"
+	"github.com/KentaroYoshizumi/Revita/internal/jev"
 	"github.com/KentaroYoshizumi/Revita/internal/property"
 )
 
 const requestTimeout = 30 * time.Second
 
-// Judge asks an LLM whether the property is a profitable investment and
-// returns its written verdict in Japanese.
+// GenerateReport asks an LLM to produce a detailed Japanese Markdown
+// advisory report for the property, given Jev's Phase-1 verdict as
+// context.
 //
 // It prefers the Claude API (ANTHROPIC_API_KEY), falls back to the
-// OpenAI API (OPENAI_API_KEY) if that is not set, and falls back to a
-// local rule-based verdict if neither API key is configured, so the CLI
-// remains usable without any network access.
-func Judge(p property.Property, m airdna.MarketData, r finance.Result) (string, error) {
-	prompt := buildPrompt(p, m, r)
+// OpenAI API (OPENAI_API_KEY) if that is not set, and falls back to
+// SimpleSummary if neither API key is configured, so the CLI remains
+// usable without any network access.
+func GenerateReport(p property.Property, m airdna.MarketData, r finance.Result, eval jev.Evaluation) (string, error) {
+	prompt := buildReportPrompt(p, m, r, eval)
 
 	if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
 		return callClaude(key, prompt)
@@ -35,13 +41,19 @@ func Judge(p property.Property, m airdna.MarketData, r finance.Result) (string, 
 	if key := os.Getenv("OPENAI_API_KEY"); key != "" {
 		return callOpenAI(key, prompt)
 	}
-	return localVerdict(r), nil
+	return SimpleSummary(eval, r), nil
 }
 
-func buildPrompt(p property.Property, m airdna.MarketData, r finance.Result) string {
+func buildReportPrompt(p property.Property, m airdna.MarketData, r finance.Result, eval jev.Evaluation) string {
 	return fmt.Sprintf(`あなたは不動産投資（特にAirbnbなどの短期賃貸運用）の専門アナリストです。
-以下の物件情報・市場データ・収支計算結果を踏まえて、この物件が「儲かるか・儲からないか」を判定し、
-その理由を日本語で3〜5行程度で簡潔に説明してください。
+以下の物件情報・市場データ・収支計算結果・一次判定（Phase 1）の結果を踏まえて、
+ユーザー向けの詳細な投資判断レポートをMarkdown形式で作成してください。
+
+レポートには以下の見出しを含めてください:
+## 総合判定
+## 数値の解説（ROI・表面/実質利回り・損益分岐稼働率）
+## リスクと留意点
+## 次に取るべきアクション
 
 【物件情報】
 - 住所: %s
@@ -61,11 +73,42 @@ func buildPrompt(p property.Property, m airdna.MarketData, r finance.Result) str
 - 想定月間損益: %.0f円
 - 想定年間損益: %.0f円
 - 年間ROI: %.2f%%
+- 表面利回り: %.2f%%
+- 実質利回り: %.2f%%
+- 損益分岐稼働率: %.1f%%
+
+【Phase 1（Jev）の一次判定】
+- 判定: %s（確度 %.0f%%）
+- 判定軸ごとの確度: %s
 `,
 		p.Address, p.PurchasePrice, p.MonthlyRent, p.SizeSqm, p.Capacity,
 		m.ADR, m.OccupancyRate*100, m.CompetitorCount, m.DataSource,
 		r.MonthlyRevenue, r.MonthlyProfit, r.AnnualProfit, r.ROIPercent,
+		r.GrossYieldPercent, r.NetYieldPercent, r.BEPOccupancyRate*100,
+		eval.Verdict, eval.Confidence*100, formatReasons(eval.Reasons),
 	)
+}
+
+// formatReasons renders Jev's per-axis confidence scores as a stable,
+// human-readable list.
+func formatReasons(reasons map[string]float64) string {
+	if len(reasons) == 0 {
+		return "(なし)"
+	}
+	keys := make([]string, 0, len(reasons))
+	for k := range reasons {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	out := ""
+	for i, k := range keys {
+		if i > 0 {
+			out += ", "
+		}
+		out += fmt.Sprintf("%s=%.2f", k, reasons[k])
+	}
+	return out
 }
 
 // --- Claude (Anthropic Messages API) ---
@@ -93,7 +136,7 @@ type claudeResponse struct {
 func callClaude(apiKey, prompt string) (string, error) {
 	reqBody := claudeRequest{
 		Model:     "claude-sonnet-5",
-		MaxTokens: 512,
+		MaxTokens: 1536,
 		Messages:  []claudeMessage{{Role: "user", Content: prompt}},
 	}
 	body, err := json.Marshal(reqBody)
@@ -197,23 +240,30 @@ func callOpenAI(apiKey, prompt string) (string, error) {
 	return parsed.Choices[0].Message.Content, nil
 }
 
-// localVerdict provides a simple rule-based judgement so the CLI still
-// produces a useful answer when no LLM API key is configured.
-func localVerdict(r finance.Result) string {
-	if r.MonthlyProfit > 0 && r.ROIPercent >= 8 {
-		return fmt.Sprintf(
-			"[ローカル簡易判定] 儲かる可能性が高いと判定します。想定月間損益は%.0f円のプラス、年間ROIは%.2f%%と一般的な投資基準（目安8%%以上）を上回っています。\n"+
-				"※この判定はLLM APIキー（ANTHROPIC_API_KEY または OPENAI_API_KEY）が未設定のため、簡易ルールによる代替判定です。",
-			r.MonthlyProfit, r.ROIPercent)
-	}
-	if r.MonthlyProfit > 0 {
-		return fmt.Sprintf(
-			"[ローカル簡易判定] 月間損益はプラス（%.0f円）ですが、年間ROIは%.2f%%と控えめです。他の物件・条件との比較を推奨します。\n"+
-				"※この判定はLLM APIキー（ANTHROPIC_API_KEY または OPENAI_API_KEY）が未設定のため、簡易ルールによる代替判定です。",
-			r.MonthlyProfit, r.ROIPercent)
-	}
+// SimpleSummary renders a short Markdown summary directly from Jev's
+// Phase-1 evaluation, without calling any LLM. The pipeline uses this
+// both as the NoGo cost-saving shortcut (skipping Phase 2 entirely) and
+// as the offline fallback when no LLM API key is configured.
+func SimpleSummary(eval jev.Evaluation, r finance.Result) string {
 	return fmt.Sprintf(
-		"[ローカル簡易判定] 儲からない可能性が高いと判定します。想定月間損益が%.0f円のマイナスとなっており、費用が市場から見込める収入を上回っています。\n"+
-			"※この判定はLLM APIキー（ANTHROPIC_API_KEY または OPENAI_API_KEY）が未設定のため、簡易ルールによる代替判定です。",
-		r.MonthlyProfit)
+		"## 総合判定\n\n**%s**（確度 %.0f%%）\n\n"+
+			"## 数値の解説\n\n"+
+			"- 想定月間損益: %.0f円\n"+
+			"- 年間ROI: %.2f%%\n"+
+			"- 表面利回り: %.2f%%\n"+
+			"- 実質利回り: %.2f%%\n"+
+			"- 損益分岐稼働率: %.1f%%\n\n"+
+			"## 補足\n\n"+
+			"これはPhase 1（Jev）の判定のみに基づく簡易サマリーです。%s\n",
+		eval.Verdict, eval.Confidence*100,
+		r.MonthlyProfit, r.ROIPercent, r.GrossYieldPercent, r.NetYieldPercent, r.BEPOccupancyRate*100,
+		simpleSummaryNote(eval),
+	)
+}
+
+func simpleSummaryNote(eval jev.Evaluation) string {
+	if eval.Verdict == jev.VerdictNoGo {
+		return "NoGo判定のため、Phase 2（LLMによる詳細レポート生成）はコスト削減のためスキップされています。"
+	}
+	return "LLM APIキー（ANTHROPIC_API_KEY または OPENAI_API_KEY）が未設定のため、詳細レポート生成をスキップしています。"
 }
