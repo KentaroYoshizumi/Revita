@@ -1,7 +1,7 @@
 # Revita（レビタ）
 
 不動産投資（短期賃貸／Airbnb運用）の収益性をチェックするツール。
-現在はフロントエンドを後回しにし、Go言語によるCLIのコアロジックのみを実装したプロトタイプです。
+コアロジックはGo言語で実装し、CLI（`cmd/revita`）と、月額300円のサブスクリプションSaaSとして動かすHTTP API（`cmd/server`）＋Next.jsフロントエンド（`web/`）の両方から利用できます。
 
 ## アーキテクチャ: 2段階（2-Phase）評価パイプライン
 
@@ -87,10 +87,69 @@ export OPENAI_API_KEY=sk-...
 
 いずれも未設定の場合、またはPhase 1がNoGoと判定した場合は、Jevの結果のみによる簡易Markdownサマリーを表示します。
 
+## SaaS運用（Supabase Auth + Stripe + レートリミット）
+
+`cmd/server`はRevitaのコアロジックを、ユーザー認証・月額300円のサブスクリプション決済・月間実行回数制限つきのHTTP APIとして公開します。`web/`はそのAPIを呼び出すNext.jsフロントエンドです。
+
+### 必要なアカウント・事前準備
+
+このリポジトリのコードだけでは動きません。以下はご自身で用意する必要があります（AirDNA/e-Stat/Jevと同様、私が代わりに登録することはできません）。
+
+1. **Supabaseプロジェクト**
+   - Authでメール/パスワード認証を有効化
+   - `supabase/migrations/0001_subscriptions_and_usage.sql`をSQL Editorで実行（`public.subscriptions`・`public.usage_counters`テーブルを作成）
+   - Project Settings → API から `URL`・`anon key`・`JWT Secret`を取得
+   - Project Settings → Database から接続文字列（`DATABASE_URL`）を取得
+2. **Stripeアカウント**
+   - ¥300/月のPriceを作成し、Price IDを取得
+   - Webhookエンドポイント（`<APIのURL>/api/billing/webhook`）を登録し、以下のイベントを送信対象にする: `checkout.session.completed`, `customer.subscription.updated`, `customer.subscription.deleted`
+   - Webhook Signing Secret（`whsec_...`）を取得
+
+### Goバックエンド（`cmd/server`）
+
+```bash
+export DATABASE_URL="postgres://..."          # Supabaseの接続文字列
+export SUPABASE_JWT_SECRET="..."              # Supabase Project Settings -> API -> JWT Secret
+export STRIPE_SECRET_KEY="sk_..."
+export STRIPE_PRICE_ID="price_..."            # ¥300/月のPrice ID
+export STRIPE_WEBHOOK_SECRET="whsec_..."
+export CHECKOUT_SUCCESS_URL="http://localhost:3000/billing/success"
+export CHECKOUT_CANCEL_URL="http://localhost:3000/billing/cancel"
+export MONTHLY_EXECUTION_LIMIT=30             # 省略時は30（月間実行回数の上限、要件に応じて調整してください）
+export FRONTEND_ORIGIN="http://localhost:3000" # CORS許可オリジン（省略時は全許可）
+# 市場データ・Jev・LLMのAPIキーは cmd/revita と同じ環境変数（ESTAT_APP_ID, TYPESAFE_API_KEY, ANTHROPIC_API_KEY 等）を使う
+
+go run ./cmd/server
+```
+
+`DATABASE_URL`・`SUPABASE_JWT_SECRET`・`STRIPE_*`・`CHECKOUT_*_URL`は必須です（未設定だと起動時にエラーで停止します）。市場データ・Jev・LLMは未設定でもモックにフォールバックして動作します。
+
+**注意**: `internal/db`（Postgresアクセス層）は、この実装を行った開発環境にPostgresインスタンスが無かったため、実際のSupabaseデータベースに対する動作確認ができていません。ご自身の環境で最初に動かす際は、サブスクリプション登録・利用回数カウントが正しくDBに反映されるか確認してください。
+
+### Next.jsフロントエンド（`web/`）
+
+```bash
+cd web
+cp .env.local.example .env.local   # 値を実際のSupabase/API情報に書き換える
+npm install
+npm run dev
+```
+
+`.env.local`に設定する値:
+
+```
+NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key
+NEXT_PUBLIC_API_BASE_URL=http://localhost:8080
+```
+
+画面構成: `/`（トップ）、`/signup`・`/login`（メール/パスワード認証）、`/dashboard`（物件入力・評価実行・結果表示・サブスクリプション登録ボタン）、`/billing/success`・`/billing/cancel`（Stripe Checkoutからのリダイレクト先）。
+
 ## ディレクトリ構成
 
 ```
 cmd/revita/            CLIエントリポイント（2段階パイプラインの起動）
+cmd/server/            SaaS用HTTP APIサーバーのエントリポイント
 internal/property/     物件情報の型定義
 internal/airdna/       市場データの取得（モック/政府統計データクライアント、共通のClientインターフェース）
 internal/estat/        e-Stat（政府統計の総合窓口）APIクライアント（稼働率取得）
@@ -100,10 +159,18 @@ internal/finance/      想定収支・ROI・BEP・表面/実質利回りの計�
 internal/jev/          Phase 1: Jev（TypeSafe AI）APIクライアントとモック判定
 internal/llm/          Phase 2: LLM APIによる詳細Markdownレポート生成
 internal/pipeline/     2段階評価パイプラインの実行ロジック（NoGo時のPhase2スキップを含む）
+internal/authn/        Supabase Auth JWTの検証ミドルウェア
+internal/billing/      Stripeサブスクリプション（Checkout作成・Webhook処理）
+internal/ratelimit/    月間実行回数のレートリミット
+internal/db/           Postgres（Supabase）への永続化層
+internal/httpapi/      SaaS用HTTPハンドラ（/api/evaluate, /api/billing/*, /api/me）
+web/                   Next.jsフロントエンド
+supabase/migrations/   Supabase（Postgres）のスキーマ定義
 data/                  民泊届出住宅数CSVなどのローカルデータ
 ```
 
 ## 今後の予定
 
 - ADR（平均日次単価）を実データ化する有料APIへの切替（AirDNA、AirROI等）
-- 画面（フロントエンド）の実装
+- `internal/db`の実際のSupabase環境での動作確認
+- Stripeの領収書・請求管理（カスタマーポータル）の導線追加
