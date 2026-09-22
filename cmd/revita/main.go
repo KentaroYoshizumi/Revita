@@ -1,7 +1,8 @@
 // Command revita is a minimal CLI prototype for Revita's core logic:
 // take a candidate property, look up short-term-rental market data for
-// its area, compute expected profitability, and ask an LLM to judge
-// whether the property is worth investing in.
+// its area, pre-compute exact profitability figures in Go, run Jev's
+// fast Phase-1 Go/Conditional/NoGo screening, and (unless the verdict is
+// NoGo) generate a detailed Phase-2 Markdown report with a large LLM.
 package main
 
 import (
@@ -11,9 +12,10 @@ import (
 
 	"github.com/KentaroYoshizumi/Revita/internal/airdna"
 	"github.com/KentaroYoshizumi/Revita/internal/estat"
-	"github.com/KentaroYoshizumi/Revita/internal/finance"
+	"github.com/KentaroYoshizumi/Revita/internal/jev"
 	"github.com/KentaroYoshizumi/Revita/internal/llm"
 	"github.com/KentaroYoshizumi/Revita/internal/minpaku"
+	"github.com/KentaroYoshizumi/Revita/internal/pipeline"
 	"github.com/KentaroYoshizumi/Revita/internal/property"
 )
 
@@ -50,21 +52,33 @@ func main() {
 		market.ADR, market.OccupancyRate*100, market.CompetitorCount)
 	fmt.Printf("出典: %s\n\n", market.DataSource)
 
-	result := finance.Calculate(p, *market)
-
-	fmt.Println("--- 想定収支 ---")
-	fmt.Printf("想定月間収入: %.0f円\n", result.MonthlyRevenue)
-	fmt.Printf("想定月間損益: %.0f円\n", result.MonthlyProfit)
-	fmt.Printf("想定年間損益: %.0f円\n", result.AnnualProfit)
-	fmt.Printf("年間ROI: %.2f%%\n\n", result.ROIPercent)
-
-	fmt.Println("--- LLMによる判定 ---")
-	verdict, err := llm.Judge(p, *market, result)
+	result, err := pipeline.Run(p, *market, evaluator(), llm.GenerateReport)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "LLMによる判定に失敗しました: %v\n", err)
+		fmt.Fprintf(os.Stderr, "評価パイプラインの実行に失敗しました: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println(verdict)
+
+	fmt.Println("--- 想定収支（Goによる事前計算） ---")
+	fmt.Printf("想定月間収入: %.0f円\n", result.Finance.MonthlyRevenue)
+	fmt.Printf("想定月間損益: %.0f円\n", result.Finance.MonthlyProfit)
+	fmt.Printf("想定年間損益: %.0f円\n", result.Finance.AnnualProfit)
+	fmt.Printf("年間ROI: %.2f%%\n", result.Finance.ROIPercent)
+	fmt.Printf("表面利回り: %.2f%%\n", result.Finance.GrossYieldPercent)
+	fmt.Printf("実質利回り: %.2f%%\n", result.Finance.NetYieldPercent)
+	fmt.Printf("損益分岐稼働率: %.1f%%\n\n", result.Finance.BEPOccupancyRate*100)
+
+	fmt.Println("--- Phase 1: Jevによる一次判定 ---")
+	fmt.Printf("判定: %s（確度 %.0f%%）\n", result.Evaluation.Verdict, result.Evaluation.Confidence*100)
+	for id, score := range result.Evaluation.Reasons {
+		fmt.Printf("  - %s: %.2f\n", id, score)
+	}
+	if result.Phase2Skipped {
+		fmt.Println("→ NoGo判定のため、Phase 2（LLMによる詳細レポート生成）はスキップされました（APIコスト削減）")
+	}
+	fmt.Println()
+
+	fmt.Println("--- Phase 2: 詳細レポート ---")
+	fmt.Println(result.Report)
 }
 
 // fetchMarketData tries Japan's free government statistics first
@@ -93,4 +107,14 @@ func fetchMarketData(address, minpakuCSVPath string) (*airdna.MarketData, error)
 		return airdna.NewMockClient().GetMarketData(address)
 	}
 	return market, nil
+}
+
+// evaluator returns the Phase-1 Jev evaluator: the real TypeSafe AI
+// client when TYPESAFE_API_KEY is configured, otherwise a deterministic
+// rule-based mock so the pipeline remains runnable offline.
+func evaluator() jev.Evaluator {
+	if apiKey := os.Getenv("TYPESAFE_API_KEY"); apiKey != "" {
+		return jev.NewClient(apiKey)
+	}
+	return jev.NewMockClient()
 }
