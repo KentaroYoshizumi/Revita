@@ -101,3 +101,48 @@ func TestRun_Phase1Error(t *testing.T) {
 		t.Fatal("expected an error when Phase 1 fails")
 	}
 }
+
+type trackingEvaluator struct {
+	called bool
+	eval   jev.Evaluation
+}
+
+func (t *trackingEvaluator) EvaluateProperty(p property.Property, m airdna.MarketData, r finance.Result) (jev.Evaluation, error) {
+	t.called = true
+	return t.eval, nil
+}
+
+func TestRun_LegallyUnachievableSkipsBothPhases(t *testing.T) {
+	// High rent relative to ADR pushes BEPOccupancyRate above the
+	// minpaku 180-day/year cap: break-even is legally impossible no
+	// matter what Jev or the LLM would say, so both should be skipped.
+	p := property.Property{Address: "東京都渋谷区神南1-1-1", PurchasePrice: 45000000, MonthlyRent: 400000}
+	m := airdna.MarketData{ADR: 18500, OccupancyRate: 0.9}
+
+	evaluator := &trackingEvaluator{eval: jev.Evaluation{Verdict: jev.VerdictGo, Confidence: 0.99}}
+	reportCalled := false
+	fakeGenerate := func(property.Property, airdna.MarketData, finance.Result, jev.Evaluation) (string, error) {
+		reportCalled = true
+		return "SHOULD NOT BE CALLED", nil
+	}
+
+	result, err := Run(p, m, evaluator, fakeGenerate)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if evaluator.called {
+		t.Error("Jev evaluator was called even though break-even is legally unachievable")
+	}
+	if reportCalled {
+		t.Error("Phase 2 report generator was called even though break-even is legally unachievable")
+	}
+	if !result.Phase1Skipped || !result.Phase2Skipped {
+		t.Errorf("Phase1Skipped/Phase2Skipped = %v/%v, want true/true", result.Phase1Skipped, result.Phase2Skipped)
+	}
+	if result.Evaluation.Verdict != jev.VerdictNoGo {
+		t.Errorf("Verdict = %v, want %v", result.Evaluation.Verdict, jev.VerdictNoGo)
+	}
+	if result.Report == "" {
+		t.Error("expected a local summary Report even when both phases are skipped")
+	}
+}

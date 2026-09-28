@@ -54,6 +54,7 @@ func main() {
 		Billing:        billingClient,
 		Limiter:        ratelimit.NewLimiter(database, limit),
 		Subscriptions:  database,
+		History:        database,
 		FetchMarket:    fetchMarketData,
 		Evaluator:      evaluator(),
 		GenerateReport: llm.GenerateReport,

@@ -2,12 +2,14 @@
 
 import { useEffect, useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { createClient } from "@/lib/supabaseClient";
 import {
   ApiError,
   evaluateProperty,
   getMe,
   startCheckout,
+  type BusinessType,
   type EvaluateResponse,
   type MeResponse,
 } from "@/lib/api";
@@ -29,6 +31,7 @@ export default function DashboardPage() {
   const [rent, setRent] = useState(150000);
   const [size, setSize] = useState(32.5);
   const [capacity, setCapacity] = useState(4);
+  const [businessType, setBusinessType] = useState<BusinessType>("minpaku");
 
   const [result, setResult] = useState<EvaluateResponse | null>(null);
   const [evalError, setEvalError] = useState<string | null>(null);
@@ -87,6 +90,7 @@ export default function DashboardPage() {
         monthly_rent: rent,
         size_sqm: size,
         capacity,
+        business_type: businessType,
       });
       setResult(res);
       refreshMe();
@@ -113,9 +117,14 @@ export default function DashboardPage() {
     <main className="mx-auto max-w-2xl p-8">
       <div className="mb-6 flex items-center justify-between">
         <h1 className="text-2xl font-bold">Revita: 物件収益性チェック</h1>
-        <button onClick={handleSignOut} className="text-sm underline">
-          ログアウト
-        </button>
+        <div className="flex items-center gap-4 text-sm">
+          <Link href="/history" className="underline">
+            評価履歴・比較
+          </Link>
+          <button onClick={handleSignOut} className="underline">
+            ログアウト
+          </button>
+        </div>
       </div>
 
       <section className="mb-6 rounded border p-4">
@@ -193,6 +202,17 @@ export default function DashboardPage() {
               className="rounded border px-3 py-2"
             />
           </label>
+          <label className="flex flex-col gap-1 text-sm">
+            営業形態
+            <select
+              value={businessType}
+              onChange={(e) => setBusinessType(e.target.value as BusinessType)}
+              className="rounded border px-3 py-2"
+            >
+              <option value="minpaku">住宅宿泊事業法（民泊、年180日規制あり）</option>
+              <option value="ryokan">旅館業許可（規制なし）</option>
+            </select>
+          </label>
         </div>
         {evalError && <p className="text-sm text-red-600">{evalError}</p>}
         <button
@@ -228,18 +248,41 @@ export default function DashboardPage() {
                 損益分岐稼働率:{" "}
                 {(result.finance.BEPOccupancyRate * 100).toFixed(1)}%
               </li>
+              <li>
+                民泊180日/年規制反映後の稼働率:{" "}
+                {(result.finance.EffectiveOccupancyRate * 100).toFixed(1)}%
+                {result.finance.LegalCapApplied && "（規制により制限あり）"}
+              </li>
             </ul>
+            {!result.finance.LegallyAchievable && (
+              <p className="mt-2 text-sm font-bold text-red-600">
+                民泊180日/年規制の範囲内では、この物件は損益分岐点に到達できません。
+              </p>
+            )}
           </div>
 
           <div className="rounded border p-4">
-            <h2 className="mb-2 font-bold">
-              Phase 1 判定: {VERDICT_LABEL[result.evaluation.Verdict]}（確度{" "}
-              {(result.evaluation.Confidence * 100).toFixed(0)}%）
-            </h2>
-            {result.phase2_skipped && (
-              <p className="mb-2 text-sm text-gray-600">
-                NoGo判定のため、Phase 2（詳細レポート生成）はスキップされました。
-              </p>
+            {result.phase1_skipped ? (
+              <>
+                <h2 className="mb-2 font-bold">
+                  Phase 1: スキップ（自動NoGo）
+                </h2>
+                <p className="mb-2 text-sm text-gray-600">
+                  民泊180日/年規制の範囲内では損益分岐点に到達できないため、Jev/LLMを呼ばず自動的にNoGoと判定しました。
+                </p>
+              </>
+            ) : (
+              <>
+                <h2 className="mb-2 font-bold">
+                  Phase 1 判定: {VERDICT_LABEL[result.evaluation.Verdict]}（確度{" "}
+                  {(result.evaluation.Confidence * 100).toFixed(0)}%）
+                </h2>
+                {result.phase2_skipped && (
+                  <p className="mb-2 text-sm text-gray-600">
+                    NoGo判定のため、Phase 2（詳細レポート生成）はスキップされました。
+                  </p>
+                )}
+              </>
             )}
             <pre className="whitespace-pre-wrap text-sm">
               {result.report_markdown}

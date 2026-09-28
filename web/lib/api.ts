@@ -30,12 +30,15 @@ async function authorizedFetch(path: string, options: RequestInit = {}) {
   });
 }
 
+export type BusinessType = "minpaku" | "ryokan";
+
 export interface EvaluateRequest {
   address: string;
   purchase_price: number;
   monthly_rent: number;
   size_sqm: number;
   capacity: number;
+  business_type: BusinessType;
 }
 
 export interface MarketData {
@@ -55,6 +58,9 @@ export interface FinanceResult {
   GrossYieldPercent: number;
   NetYieldPercent: number;
   BEPOccupancyRate: number;
+  EffectiveOccupancyRate: number;
+  LegalCapApplied: boolean;
+  LegallyAchievable: boolean;
 }
 
 export interface Evaluation {
@@ -64,10 +70,12 @@ export interface Evaluation {
 }
 
 export interface EvaluateResponse {
+  id: string;
   market: MarketData;
   finance: FinanceResult;
   evaluation: Evaluation;
   report_markdown: string;
+  phase1_skipped: boolean;
   phase2_skipped: boolean;
   remaining_quota: number;
 }
@@ -111,4 +119,49 @@ export async function startCheckout(): Promise<string> {
     throw new ApiError(res.status, body);
   }
   return body.url as string;
+}
+
+export interface EvaluationSummary {
+  id: string;
+  address: string;
+  verdict: "Go" | "Conditional" | "NoGo";
+  net_yield_percent: number;
+  roi_percent: number;
+  created_at: string;
+}
+
+export async function listEvaluations(): Promise<EvaluationSummary[]> {
+  const res = await authorizedFetch("/api/evaluations");
+  const body = await res.json();
+  if (!res.ok) {
+    throw new ApiError(res.status, body);
+  }
+  return body as EvaluationSummary[];
+}
+
+export interface RankingEntry {
+  id: string;
+  address: string;
+  value: number;
+}
+
+export interface CompareResult {
+  by_net_yield: RankingEntry[];
+  by_bep_margin: RankingEntry[];
+  recommended_id: string;
+  narrative: string;
+}
+
+export async function compareEvaluations(
+  ids: string[]
+): Promise<CompareResult> {
+  const res = await authorizedFetch("/api/evaluations/compare", {
+    method: "POST",
+    body: JSON.stringify({ ids }),
+  });
+  const body = await res.json();
+  if (!res.ok) {
+    throw new ApiError(res.status, body);
+  }
+  return body as CompareResult;
 }

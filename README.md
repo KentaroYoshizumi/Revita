@@ -19,10 +19,13 @@
    - **ADR（平均日次単価）**: 無料の政府データに相当するものがないため、当面はモック値
    - `ESTAT_APP_ID`未設定時、または取得に失敗した場合は、全項目をAirDNA形状のモックデータにフォールバックする
 3. 物件コストと市場データから想定収支（月間収入・月間損益・年間損益・年間ROI・表面/実質利回り・損益分岐稼働率）を計算する
+   - **民泊180日/年規制**: 住宅宿泊事業法（民泊）登録の場合、年間営業日数は180日が上限。市場の稼働率がこれを上回っていても、実際に得られる収入は180日/年ベースにキャップして計算する（旅館業許可の場合はキャップなし。`--business-type`で切替可能）
+   - 損益分岐稼働率がこの180日/年キャップを超える（＝法的に達成不可能）場合は、Jev・LLMを呼ばずに自動でNoGo判定とし、APIコストをかけない
 4. Phase 1: 計算結果と市場データをJevに渡し、Go/Conditional/NoGoの一次判定と確度スコアを得る
    - `TYPESAFE_API_KEY`未設定の場合は、ROI・稼働率マージンに基づくルールベースのモック判定にフォールバックする
 5. Phase 2: 一次判定がNoGoでなければ、LLM（Claude APIまたはOpenAI API）で詳細なMarkdownレポートを生成する
-   - NoGo判定、またはLLM APIキー未設定の場合は、Jevの結果のみによる簡易サマリーにフォールバックする（APIコスト削減）
+   - NoGo判定、またはLLM APIキー未設定の場合は、Jevの判定軸（ROI・稼働率マージン・法的達成可能性）をルールベースで言語化した簡易サマリーにフォールバックする（APIコスト削減）
+6. 評価履歴をユーザーごとに保存し、複数物件を実質利回り・損益分岐マージンで比較する（`internal/compare`、Jev/LLMの再呼び出し無しの無料機能）
 
 ## 使い方
 
@@ -35,7 +38,7 @@ go run ./cmd/revita \
   --capacity=4
 ```
 
-フラグを省略するとサンプル物件情報で実行されます。
+フラグを省略するとサンプル物件情報で実行されます。`--business-type=ryokan`を指定すると、民泊180日/年規制を適用しない（旅館業許可想定の）計算になります。
 
 ### Phase 1（Jev）を実データ化する
 
@@ -97,7 +100,9 @@ export OPENAI_API_KEY=sk-...
 
 1. **Supabaseプロジェクト**
    - Authでメール/パスワード認証を有効化
-   - `supabase/migrations/0001_subscriptions_and_usage.sql`をSQL Editorで実行（`public.subscriptions`・`public.usage_counters`テーブルを作成）
+   - `supabase/migrations/`配下のSQLをSQL Editorで**順番に**実行
+     - `0001_subscriptions_and_usage.sql`: `public.subscriptions`・`public.usage_counters`
+     - `0002_evaluations.sql`: `public.evaluations`（評価履歴・比較機能用）
    - Project Settings → API から `URL`・`anon key`・`JWT Secret`を取得
    - Project Settings → Database から接続文字列（`DATABASE_URL`）を取得
 2. **Stripeアカウント**
@@ -143,7 +148,18 @@ NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key
 NEXT_PUBLIC_API_BASE_URL=http://localhost:8080
 ```
 
-画面構成: `/`（トップ）、`/signup`・`/login`（メール/パスワード認証）、`/dashboard`（物件入力・評価実行・結果表示・サブスクリプション登録ボタン）、`/billing/success`・`/billing/cancel`（Stripe Checkoutからのリダイレクト先）。
+画面構成: `/`（トップ）、`/signup`・`/login`（メール/パスワード認証）、`/dashboard`（物件入力・評価実行・結果表示・サブスクリプション登録ボタン）、`/history`（評価履歴一覧・複数物件の比較）、`/billing/success`・`/billing/cancel`（Stripe Checkoutからのリダイレクト先）。
+
+### APIエンドポイント一覧
+
+| エンドポイント | 認証 | 内容 |
+|---|---|---|
+| `POST /api/evaluate` | 要 | 物件を評価（サブスク必須・月間実行回数制限あり） |
+| `GET /api/evaluations` | 要 | 自分の評価履歴一覧を取得（無料・レートリミット対象外） |
+| `POST /api/evaluations/compare` | 要 | 選択した2件以上の評価履歴を比較（無料・LLM/Jev呼び出し無し） |
+| `POST /api/billing/checkout` | 要 | Stripe Checkoutセッションを作成 |
+| `POST /api/billing/webhook` | Stripe署名 | Stripe Webhookイベントの受信 |
+| `GET /api/me` | 要 | 自分のサブスクリプション状態を取得 |
 
 ## ディレクトリ構成
 
@@ -162,8 +178,10 @@ internal/pipeline/     2段階評価パイプラインの実行ロジック（No
 internal/authn/        Supabase Auth JWTの検証ミドルウェア
 internal/billing/      Stripeサブスクリプション（Checkout作成・Webhook処理）
 internal/ratelimit/    月間実行回数のレートリミット
+internal/history/      評価履歴の型定義とStoreインターフェース
+internal/compare/      複数物件評価の比較ロジック（Go計算のみ、LLM/Jev呼び出し無し）
 internal/db/           Postgres（Supabase）への永続化層
-internal/httpapi/      SaaS用HTTPハンドラ（/api/evaluate, /api/billing/*, /api/me）
+internal/httpapi/      SaaS用HTTPハンドラ（/api/evaluate, /api/evaluations*, /api/billing/*, /api/me）
 web/                   Next.jsフロントエンド
 supabase/migrations/   Supabase（Postgres）のスキーマ定義
 data/                  民泊届出住宅数CSVなどのローカルデータ

@@ -52,6 +52,7 @@ func buildReportPrompt(p property.Property, m airdna.MarketData, r finance.Resul
 レポートには以下の見出しを含めてください:
 ## 総合判定
 ## 数値の解説（ROI・表面/実質利回り・損益分岐稼働率）
+## 民泊営業日数規制について
 ## リスクと留意点
 ## 次に取るべきアクション
 
@@ -61,6 +62,7 @@ func buildReportPrompt(p property.Property, m airdna.MarketData, r finance.Resul
 - 月額費用（賃料・管理費等）: %.0f円
 - 広さ: %.1f平米
 - 定員: %d名
+- 営業形態: %s
 
 【該当エリアの市場データ】
 - 平均日次単価(ADR): %.0f円
@@ -76,17 +78,34 @@ func buildReportPrompt(p property.Property, m airdna.MarketData, r finance.Resul
 - 表面利回り: %.2f%%
 - 実質利回り: %.2f%%
 - 損益分岐稼働率: %.1f%%
+- 実際に計算に用いた稼働率（民泊180日/年規制を反映後）: %.1f%%
+- 民泊180日規制によって収入が制限されているか: %s
 
 【Phase 1（Jev）の一次判定】
 - 判定: %s（確度 %.0f%%）
 - 判定軸ごとの確度: %s
 `,
-		p.Address, p.PurchasePrice, p.MonthlyRent, p.SizeSqm, p.Capacity,
+		p.Address, p.PurchasePrice, p.MonthlyRent, p.SizeSqm, p.Capacity, businessTypeLabel(p.BusinessType),
 		m.ADR, m.OccupancyRate*100, m.CompetitorCount, m.DataSource,
 		r.MonthlyRevenue, r.MonthlyProfit, r.AnnualProfit, r.ROIPercent,
 		r.GrossYieldPercent, r.NetYieldPercent, r.BEPOccupancyRate*100,
+		r.EffectiveOccupancyRate*100, yesNo(r.LegalCapApplied),
 		eval.Verdict, eval.Confidence*100, formatReasons(eval.Reasons),
 	)
+}
+
+func businessTypeLabel(bt property.BusinessType) string {
+	if bt == property.BusinessTypeRyokan {
+		return "旅館業許可（180日規制の対象外）"
+	}
+	return "住宅宿泊事業法（民泊、年180日規制の対象）"
+}
+
+func yesNo(b bool) string {
+	if b {
+		return "はい"
+	}
+	return "いいえ"
 }
 
 // formatReasons renders Jev's per-axis confidence scores as a stable,
@@ -244,21 +263,89 @@ func callOpenAI(apiKey, prompt string) (string, error) {
 // Phase-1 evaluation, without calling any LLM. The pipeline uses this
 // both as the NoGo cost-saving shortcut (skipping Phase 2 entirely) and
 // as the offline fallback when no LLM API key is configured.
+//
+// It includes a rule-based "判定理由" section derived from eval.Reasons
+// so that even without an LLM call — most importantly on a NoGo verdict,
+// where the user most wants to know why — the report says WHY, not just
+// WHAT the numbers are.
 func SimpleSummary(eval jev.Evaluation, r finance.Result) string {
 	return fmt.Sprintf(
 		"## 総合判定\n\n**%s**（確度 %.0f%%）\n\n"+
+			"## 判定理由\n\n%s\n\n"+
 			"## 数値の解説\n\n"+
 			"- 想定月間損益: %.0f円\n"+
 			"- 年間ROI: %.2f%%\n"+
 			"- 表面利回り: %.2f%%\n"+
 			"- 実質利回り: %.2f%%\n"+
-			"- 損益分岐稼働率: %.1f%%\n\n"+
+			"- 損益分岐稼働率: %.1f%%\n"+
+			"- 民泊180日/年規制の反映後の稼働率: %.1f%%（規制により制限: %s）\n\n"+
 			"## 補足\n\n"+
 			"これはPhase 1（Jev）の判定のみに基づく簡易サマリーです。%s\n",
 		eval.Verdict, eval.Confidence*100,
+		explainReasons(eval, r),
 		r.MonthlyProfit, r.ROIPercent, r.GrossYieldPercent, r.NetYieldPercent, r.BEPOccupancyRate*100,
+		r.EffectiveOccupancyRate*100, yesNo(r.LegalCapApplied),
 		simpleSummaryNote(eval),
 	)
+}
+
+// explainReasons turns Jev's per-axis confidence scores into short
+// Japanese bullet points explaining why the verdict came out the way it
+// did. It recognizes the two axes Revita's own Jev questions ask about
+// (roi_sufficient, occupancy_margin_safe) for specific phrasing, and
+// falls back to a generic "軸=スコア" line for any other axis so a
+// future added question still produces some explanation instead of
+// silently being dropped.
+func explainReasons(eval jev.Evaluation, r finance.Result) string {
+	var lines []string
+
+	if score, ok := eval.Reasons["legally_achievable"]; ok && score < 0.5 {
+		lines = append(lines, fmt.Sprintf(
+			"- 住宅宿泊事業法（民泊）の年間営業日数上限（%.0f日/年）の範囲内では、損益分岐点(稼働率%.1f%%相当)に到達すること自体ができません。旅館業許可の取得や、月額費用の見直しが必要です。",
+			finance.MinpakuMaxDaysPerYear, r.BEPOccupancyRate*100,
+		))
+	}
+
+	if score, ok := eval.Reasons["roi_sufficient"]; ok {
+		if score >= 0.5 {
+			lines = append(lines, fmt.Sprintf("- 年間ROI(%.2f%%)は投資基準（目安8%%以上）を満たしています。", r.ROIPercent))
+		} else {
+			lines = append(lines, fmt.Sprintf("- 年間ROI(%.2f%%)が投資基準（目安8%%以上）を下回っています。", r.ROIPercent))
+		}
+	}
+
+	if score, ok := eval.Reasons["occupancy_margin_safe"]; ok {
+		margin := r.BEPOccupancyRate * 100 // 損益分岐稼働率(%)。市場稼働率との差は呼び出し側の数値解説セクションで別途表示される。
+		if score >= 0.5 {
+			lines = append(lines, fmt.Sprintf("- 損益分岐稼働率(%.1f%%)に対して、市場の稼働率には十分な余裕があります。", margin))
+		} else {
+			lines = append(lines, fmt.Sprintf("- 損益分岐稼働率(%.1f%%)に対して、市場の稼働率の余裕が小さい（またはマイナス）です。", margin))
+		}
+	}
+
+	keys := make([]string, 0, len(eval.Reasons))
+	for k := range eval.Reasons {
+		if k == "roi_sufficient" || k == "occupancy_margin_safe" || k == "legally_achievable" {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		lines = append(lines, fmt.Sprintf("- %s: %.2f", k, eval.Reasons[k]))
+	}
+
+	if len(lines) == 0 {
+		return "(判定根拠のスコアがありません)"
+	}
+	out := ""
+	for i, line := range lines {
+		if i > 0 {
+			out += "\n"
+		}
+		out += line
+	}
+	return out
 }
 
 func simpleSummaryNote(eval jev.Evaluation) string {

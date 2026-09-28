@@ -25,6 +25,7 @@ func main() {
 	rent := flag.Float64("rent", 150000, "月額費用（賃料・管理費等、円）")
 	size := flag.Float64("size", 32.5, "広さ（平米）")
 	capacity := flag.Int("capacity", 4, "定員（最大宿泊人数）")
+	businessType := flag.String("business-type", "minpaku", "営業形態: minpaku（住宅宿泊事業法、年180日規制あり）または ryokan（旅館業許可、規制なし）")
 	minpakuCSV := flag.String("minpaku-csv", "data/minpaku_todokede.csv", "民泊届出住宅数CSVのパス（競合物件数の実データ用、省略可）")
 	flag.Parse()
 
@@ -34,6 +35,7 @@ func main() {
 		MonthlyRent:   *rent,
 		SizeSqm:       *size,
 		Capacity:      *capacity,
+		BusinessType:  property.BusinessType(*businessType),
 	}
 
 	fmt.Println("=== Revita: 物件収益性チェック ===")
@@ -65,15 +67,22 @@ func main() {
 	fmt.Printf("年間ROI: %.2f%%\n", result.Finance.ROIPercent)
 	fmt.Printf("表面利回り: %.2f%%\n", result.Finance.GrossYieldPercent)
 	fmt.Printf("実質利回り: %.2f%%\n", result.Finance.NetYieldPercent)
-	fmt.Printf("損益分岐稼働率: %.1f%%\n\n", result.Finance.BEPOccupancyRate*100)
+	fmt.Printf("損益分岐稼働率: %.1f%%\n", result.Finance.BEPOccupancyRate*100)
+	fmt.Printf("民泊180日/年規制反映後の稼働率: %.1f%%（規制により制限: %s）\n\n",
+		result.Finance.EffectiveOccupancyRate*100, yesNo(result.Finance.LegalCapApplied))
 
-	fmt.Println("--- Phase 1: Jevによる一次判定 ---")
-	fmt.Printf("判定: %s（確度 %.0f%%）\n", result.Evaluation.Verdict, result.Evaluation.Confidence*100)
-	for id, score := range result.Evaluation.Reasons {
-		fmt.Printf("  - %s: %.2f\n", id, score)
-	}
-	if result.Phase2Skipped {
-		fmt.Println("→ NoGo判定のため、Phase 2（LLMによる詳細レポート生成）はスキップされました（APIコスト削減）")
+	if result.Phase1Skipped {
+		fmt.Println("--- Phase 1: スキップ ---")
+		fmt.Println("→ 民泊180日/年規制の範囲内では損益分岐点に到達できないため、Jev/LLMを呼ばず自動的にNoGoと判定しました（APIコスト削減）")
+	} else {
+		fmt.Println("--- Phase 1: Jevによる一次判定 ---")
+		fmt.Printf("判定: %s（確度 %.0f%%）\n", result.Evaluation.Verdict, result.Evaluation.Confidence*100)
+		for id, score := range result.Evaluation.Reasons {
+			fmt.Printf("  - %s: %.2f\n", id, score)
+		}
+		if result.Phase2Skipped {
+			fmt.Println("→ NoGo判定のため、Phase 2（LLMによる詳細レポート生成）はスキップされました（APIコスト削減）")
+		}
 	}
 	fmt.Println()
 
@@ -117,4 +126,11 @@ func evaluator() jev.Evaluator {
 		return jev.NewClient(apiKey)
 	}
 	return jev.NewMockClient()
+}
+
+func yesNo(b bool) string {
+	if b {
+		return "はい"
+	}
+	return "いいえ"
 }
